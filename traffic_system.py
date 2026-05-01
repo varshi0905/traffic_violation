@@ -51,67 +51,132 @@ annotated = result[0].plot()
 from google.colab.patches import cv2_imshow
 cv2_imshow(annotated)
 
-video_path = "/content/drive/MyDrive/traffic1.mp4"
-
-import os
-print(os.path.exists(video_path))
-
 !ls /content/drive/Mydriv
 
 !du -h /content/output.mp4
 
-!pip install  requests
-
-#extract clear frames from your video
-import cv2
-import os
-
-cap = cv2.VideoCapture("/content/drive/MyDrive/traffic2.mp4")
-os.makedirs("/content/drive/MyDrive/test_images", exist_ok=True)
-
-frame_count = 0
-saved_count = 0
-
-while cap.isOpened():
-    ret, frame = cap.read()
-    if not ret:
-        break
-
-    frame_count += 1
-
-    # Save every 30th frame (1 per second approx)
-    if frame_count % 60 == 0:
-        path = f"/content/drive/MyDrive/test_images/image_{frame_count}.jpg"
-        cv2.imwrite(path, frame)
-        saved_count += 1
-
-cap.release()
-print(f"Saved {saved_count} frames")
-
-# Cell 1 — all the code above
-# Cell 2 — extract frames from video
-# Cell 3 — test single image
-img = cv2.imread("/content/drive/MyDrive/test_images/image_105.jpg")
-result, violations = process_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-cv2_imshow(cv2.cvtColor(result, cv2.COLOR_RGB2BGR))
-print(violations)
-
-"""code without ocr"""
+!pip install transformers torch torchvision
 
 import cv2
 import numpy as np
 import os
 import datetime
+import sqlite3
+import re
+from PIL import Image
+from transformers import TrOCRProcessor, VisionEncoderDecoderModel
 from ultralytics import YOLO
+
+# -------- INIT TrOCR --------
+print("Loading TrOCR model...")
+processor = TrOCRProcessor.from_pretrained('microsoft/trocr-base-printed')
+trocr_model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-printed')
+print("TrOCR ready.")
+
+# -------- LOAD MODEL --------
 
 
 # -------- FOLDERS --------
 os.makedirs("/content/drive/MyDrive/violations/no_helmet", exist_ok=True)
 os.makedirs("/content/drive/MyDrive/violations/triple_riding", exist_ok=True)
 
+# -------- GLOBALS --------
 violation_count = 0
+seen_plates = set()
 
-# ---------------- HELMET MATCHING ----------------
+# -------- DATABASE --------
+def init_db():
+    conn = sqlite3.connect("/content/drive/MyDrive/violations/violations.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS violations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            violation_type TEXT,
+            plate_number TEXT,
+            frame_number INTEGER,
+            frame_path TEXT,
+            plate_path TEXT
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def save_to_db(timestamp, violation_type, plate_number,
+               frame_number, frame_path, plate_path):
+    conn = sqlite3.connect("/content/drive/MyDrive/violations/violations.db")
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO violations
+        (timestamp, violation_type, plate_number, frame_number, frame_path, plate_path)
+        VALUES (?, ?, ?, ?, ?, ?)
+    ''', (timestamp, violation_type, plate_number,
+          frame_number, frame_path, plate_path))
+    conn.commit()
+    conn.close()
+
+# -------- OCR --------
+def preprocess_plate(plate_img):
+    plate_img = cv2.resize(plate_img, None, fx=3, fy=3,
+                           interpolation=cv2.INTER_CUBIC)
+    gray = cv2.cvtColor(plate_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 9, 75, 75)
+    kernel = np.array([[0, -1, 0],
+                       [-1,  5, -1],
+                       [0, -1, 0]])
+    sharpened = cv2.filter2D(gray, -1, kernel)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    enhanced = clahe.apply(sharpened)
+    return cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+
+def ocr_region(region_bgr):
+    pil_img = Image.fromarray(cv2.cvtColor(region_bgr, cv2.COLOR_BGR2RGB))
+    pixel_values = processor(pil_img, return_tensors="pt").pixel_values
+    generated_ids = trocr_model.generate(pixel_values)
+    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+    return text.upper().replace(" ", "")
+
+def clean(text):
+    return (text.replace("O", "0")
+                .replace("I", "1")
+                .replace("S", "5"))
+
+def read_plate(plate_img):
+    try:
+        processed = preprocess_plate(plate_img)
+        h, w = processed.shape[:2]
+
+        full = processed
+        top  = processed[0:h//2, 0:w]
+        bot  = processed[h//2:h, 0:w]
+
+        full_text = ocr_region(full)
+        top_text  = ocr_region(top)
+        bot_text  = ocr_region(bot)
+
+        print(f"  OCR → full: {full_text} | top: {top_text} | bottom: {bot_text}")
+
+        # Try regex on each region individually
+        for text in [full_text, top_text, bot_text]:
+            cleaned = clean(text)
+            match = re.search(r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}', cleaned)
+            if match:
+                return match.group(0)
+
+        # Try top + bottom combined
+        combined = clean(top_text + bot_text)
+        match = re.search(r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}', combined)
+        if match:
+            return match.group(0)
+
+        # Fallback — return combined if long enough, else UNREADABLE
+        return combined if is_valid_plate(combined) else "UNREADABLE"
+
+    except Exception as e:
+        print(f"  OCR error: {e}")
+        return "UNREADABLE"
+
+# -------- DETECTION HELPERS --------
 def helmet_on_rider(rider, helmets):
     rx1, ry1, rx2, ry2 = rider
     head_box = (rx1, ry1, rx2, ry1 + int((ry2 - ry1) * 0.35))
@@ -122,7 +187,6 @@ def helmet_on_rider(rider, helmets):
             return True
     return False
 
-# ---------------- HELPERS ----------------
 def get_center(box):
     x1, y1, x2, y2 = box
     return ((x1 + x2) // 2, (y1 + y2) // 2)
@@ -141,88 +205,96 @@ def rider_has_plate(rider, plate):
     vertically_in_bottom = py1 >= rider_middle
     return horizontally_inside and vertically_in_bottom
 
+# -------- SAVE VIOLATION --------
 def save_violation(frame, rider_box, plate_box, violation_type, frame_count):
-    """
-    Saves two images:
-    1. Full frame with violation highlighted
-    2. Plate crop (if available)
-    """
-    global violation_count
-    violation_count += 1
+    global violation_count, seen_plates
 
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     folder = f"/content/drive/MyDrive/violations/{violation_type}"
 
     rx1, ry1, rx2, ry2 = rider_box
 
-    #Save full frame with box
+    # Draw and save full frame
     frame_copy = frame.copy()
     cv2.rectangle(frame_copy, (rx1, ry1), (rx2, ry2), (0, 0, 255), 3)
     cv2.putText(frame_copy, violation_type.upper().replace("_", " "),
                 (rx1, ry1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-
     frame_path = f"{folder}/frame_{frame_count}_{timestamp}.jpg"
     cv2.imwrite(frame_path, frame_copy)
-    print(f"Saved full frame: {frame_path}")
 
-    #save the plate if exits
+    plate_text = "NO PLATE"
+    plate_path = None
+
     if plate_box:
         px1, py1, px2, py2 = plate_box
-
-        pad_y = max(40, int((py2 - py1) * 0.5))
-        pad_x = max(20, int((px2 - px1) * 0.2))
-        py1_p = max(0, py1 - pad_y)
-        py2_p = min(frame.shape[0], py2 + pad_y)
-        px1_p = max(0, px1 - pad_x)
-        px2_p = min(frame.shape[1], px2 + pad_x)
-
-        plate_crop = frame[py1_p:py2_p, px1_p:px2_p]
+        plate_crop = frame[py1:py2, px1:px2]
 
         if plate_crop.size > 0:
+            # Run OCR
+            plate_text = read_plate(plate_crop)
+            print(f"  Plate: {plate_text}")
+
+            # Deduplication — skip if same plate in same 50-frame window
+            plate_key = (plate_text, frame_count // 50)
+            if plate_text not in ["NO PLATE", "UNREADABLE"] and plate_key in seen_plates:
+                print(f"  Duplicate skipped: {plate_text}")
+                return
+            seen_plates.add(plate_key)
+
+            # Save plate crop
             plate_path = f"{folder}/plate_{frame_count}_{timestamp}.jpg"
             cv2.imwrite(plate_path, plate_crop)
-            print(f"Saved plate crop: {plate_path}")
 
+    violation_count += 1
+    save_to_db(
+        timestamp,
+        violation_type,
+        plate_text,
+        frame_count,
+        frame_path,
+        plate_path if plate_path else "NO PLATE"
+    )
+    print(f"  Saved violation #{violation_count} | {violation_type} | {plate_text}")
+def is_valid_plate(text):
+  if len(text) < 8 or len(text) > 10:
+        return False
+  if not text[:2].isalpha():
+        return False
+  match = re.search(r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}', text)
+  return match is not None
+# -------- MAIN --------
+init_db()
 
-cap = cv2.VideoCapture("/content/drive/MyDrive/traffic2.mp4")#video
-
+cap = cv2.VideoCapture("/content/drive/MyDrive/traffic2.mp4")
 if not cap.isOpened():
     print("Error: Could not open video.")
     exit()
 
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps    = cap.get(cv2.CAP_PROP_FPS)
-if fps == 0:
-    fps = 30
-
-out = cv2.VideoWriter(
-    "/content/output.mp4",
-    cv2.VideoWriter_fourcc(*'mp4v'),
-    fps,
-    (width, height)
-)
-
 frame_count = 0
-
-# To avoid saving same violation every frame
 saved_keys = set()
 
-# ---------------- MAIN LOOP ----------------
+print("Starting detection...")
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
     frame_count += 1
+
+    # Process every 30th frame only
+    if frame_count % 30 != 0:
+        continue
+
+    results = helmet_model(frame)
+
     helmets, plates, riders = [], [], []
 
-    # DETECTIONS
-    results = helmet_model(frame, imgsz=640)
     for box in results[0].boxes:
-        cls = int(box.cls[0])
+        cls   = int(box.cls[0])
         label = helmet_model.names[cls]
         x1, y1, x2, y2 = map(int, box.xyxy[0])
+
         if label == "helmet":
             helmets.append((x1, y1, x2, y2))
         elif label == "license_plate":
@@ -230,7 +302,7 @@ while cap.isOpened():
         elif label == "motorcyclist":
             riders.append((x1, y1, x2, y2))
 
-    # GROUP RIDERS
+    # Group riders for triple riding detection
     groups = []
     for rider in riders:
         placed = False
@@ -242,67 +314,51 @@ while cap.isOpened():
         if not placed:
             groups.append([rider])
 
-    # PROCESS
     for group in groups:
 
-        # TRIPLE RIDING
+        # Triple riding
         if len(group) >= 3:
             for rider in group:
                 x1, y1, x2, y2 = rider
-                cv2.rectangle(frame, (x1,y1),(x2,y2),(0,0,255),2)
-                cv2.putText(frame, "TRIPLE RIDING", (x1, y1-30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(frame, "TRIPLE RIDING", (x1, y1 - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-            # Save once per group per 30 frames
             group_key = (tuple(group[0]), "triple")
-            if group_key not in saved_keys or frame_count % 30 == 0:
+            if group_key not in saved_keys:
                 saved_keys.add(group_key)
-
-                # Find plate for first rider in group
                 nearby_plates = [p for p in plates if rider_has_plate(group[0], p)]
                 plate_box = nearby_plates[0] if nearby_plates else None
-
                 save_violation(frame, group[0], plate_box, "triple_riding", frame_count)
 
-        # HELMET CHECK
+        # No helmet
         for rider in group:
             rx1, ry1, rx2, ry2 = rider
-            has_helm = helmet_on_rider(rider, helmets)
-
-            if not has_helm:
-                cv2.rectangle(frame, (rx1,ry1),(rx2,ry2),(0,0,255),2)
-                cv2.putText(frame, "NO HELMET", (rx1, ry1-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            if not helmet_on_rider(rider, helmets):
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 0, 255), 2)
+                cv2.putText(frame, "NO HELMET", (rx1, ry1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                 nearby_plates = [p for p in plates if rider_has_plate(rider, p)]
-
                 if nearby_plates:
                     px1, py1, px2, py2 = nearby_plates[0]
-                    cv2.rectangle(frame, (px1,py1),(px2,py2),(255,255,0),2)
-                    cv2.putText(frame, "PLATE", (px1, py1-10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 2)
+                    cv2.rectangle(frame, (px1, py1), (px2, py2), (255, 255, 0), 2)
+                    cv2.putText(frame, "PLATE", (px1, py1 - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
 
-                # Save once per rider per 30 frames
-                rider_key = ((rx1//50, ry1//50), "helmet")
-                if rider_key not in saved_keys or frame_count % 80 == 0:
+                rider_key = ((rx1 // 50, ry1 // 50), "helmet", frame_count // 30)
+                if rider_key not in saved_keys:
                     saved_keys.add(rider_key)
                     plate_box = nearby_plates[0] if nearby_plates else None
                     save_violation(frame, rider, plate_box, "no_helmet", frame_count)
 
             else:
-                cv2.rectangle(frame, (rx1,ry1),(rx2,ry2),(0,255,0),2)
-                cv2.putText(frame, "HELMET", (rx1, ry1-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+                cv2.rectangle(frame, (rx1, ry1), (rx2, ry2), (0, 255, 0), 2)
+                cv2.putText(frame, "HELMET OK", (rx1, ry1 - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
-    out.write(frame)
-
-    if frame_count % 50 == 0:
+    if frame_count % 150 == 0:
         print(f"Processed {frame_count} frames | Violations saved: {violation_count}")
 
 cap.release()
-out.release()
-
-print(f"\nDone! Total frames: {frame_count}")
-print(f"Total violations saved: {violation_count}")
-print(f"Check /content/violations/ folder")
-
+print(f"\nDone! | Total frames: {frame_count} | Violations saved: {violation_count}")
