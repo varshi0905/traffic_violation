@@ -41,9 +41,6 @@ helmet_model = YOLO("/content/drive/MyDrive/best.pt")
 
 helmet_model.names  # run this to see all classes
 
-# Yours likely outputs something like:
-# {0: 'helmet', 1: 'license_plate', 2: 'motorcyclist'}
-
 from ultralytics import YOLO
 result=helmet_model("/content/drive/MyDrive/dataset/train/images/sample.jpg", show=True)
 annotated = result[0].plot()
@@ -156,27 +153,27 @@ def read_plate(plate_img):
 
         print(f"  OCR → full: {full_text} | top: {top_text} | bottom: {bot_text}")
 
-        # Try regex on each region individually
+
         for text in [full_text, top_text, bot_text]:
             cleaned = clean(text)
             match = re.search(r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}', cleaned)
             if match:
                 return match.group(0)
 
-        # Try top + bottom combined
+
         combined = clean(top_text + bot_text)
         match = re.search(r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}', combined)
         if match:
             return match.group(0)
 
-        # Fallback — return combined if long enough, else UNREADABLE
+
         return combined if is_valid_plate(combined) else "UNREADABLE"
 
     except Exception as e:
         print(f"  OCR error: {e}")
         return "UNREADABLE"
 
-# -------- DETECTION HELPERS --------
+
 def helmet_on_rider(rider, helmets):
     rx1, ry1, rx2, ry2 = rider
     head_box = (rx1, ry1, rx2, ry1 + int((ry2 - ry1) * 0.35))
@@ -214,7 +211,7 @@ def save_violation(frame, rider_box, plate_box, violation_type, frame_count):
 
     rx1, ry1, rx2, ry2 = rider_box
 
-    # Draw and save full frame
+
     frame_copy = frame.copy()
     cv2.rectangle(frame_copy, (rx1, ry1), (rx2, ry2), (0, 0, 255), 3)
     cv2.putText(frame_copy, violation_type.upper().replace("_", " "),
@@ -230,18 +227,18 @@ def save_violation(frame, rider_box, plate_box, violation_type, frame_count):
         plate_crop = frame[py1:py2, px1:px2]
 
         if plate_crop.size > 0:
-            # Run OCR
+
             plate_text = read_plate(plate_crop)
             print(f"  Plate: {plate_text}")
 
-            # Deduplication — skip if same plate in same 50-frame window
+
             plate_key = (plate_text, frame_count // 50)
             if plate_text not in ["NO PLATE", "UNREADABLE"] and plate_key in seen_plates:
                 print(f"  Duplicate skipped: {plate_text}")
                 return
             seen_plates.add(plate_key)
 
-            # Save plate crop
+
             plate_path = f"{folder}/plate_{frame_count}_{timestamp}.jpg"
             cv2.imwrite(plate_path, plate_crop)
 
@@ -282,7 +279,7 @@ while cap.isOpened():
 
     frame_count += 1
 
-    # Process every 30th frame only
+    # Process every 30th frame
     if frame_count % 30 != 0:
         continue
 
@@ -302,7 +299,7 @@ while cap.isOpened():
         elif label == "motorcyclist":
             riders.append((x1, y1, x2, y2))
 
-    # Group riders for triple riding detection
+
     groups = []
     for rider in riders:
         placed = False
