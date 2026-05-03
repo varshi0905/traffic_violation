@@ -2,7 +2,7 @@
 This is computer vision pipeline which uses YOLOv8 for object detection and  custom logic for the recognition of traffic violations such as no helmet, triple riding and uses TrOCR to read the number plate of the violating vehicles and stores them along with time stamps in the SQLite databbase.
 
 # Pipeline
- 1.The YOLOv8 processes every 30th frame of the input video
+ 1.The YOLOv8 processes every 30th frame of the input video </n>
  2.Helmet Check:
       It matches helmet to rider and flags no helemt riders
  3.Triple riding:
