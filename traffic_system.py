@@ -70,7 +70,7 @@ processor = TrOCRProcessor.from_pretrained('microsoft/trocr-base-printed')
 trocr_model = VisionEncoderDecoderModel.from_pretrained('microsoft/trocr-base-printed')
 print("TrOCR ready.")
 
-# -------- LOAD MODEL --------
+
 
 
 # -------- FOLDERS --------
@@ -120,7 +120,7 @@ def preprocess_plate(plate_img):
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
     kernel = np.array([[0, -1, 0],
                        [-1,  5, -1],
-                       [0, -1, 0]])
+                       [0, -1, 0]])  # Convolution matrix
     sharpened = cv2.filter2D(gray, -1, kernel)
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced = clahe.apply(sharpened)
@@ -358,4 +358,4 @@ while cap.isOpened():
         print(f"Processed {frame_count} frames | Violations saved: {violation_count}")
 
 cap.release()
-print(f"\nDone! | Total frames: {frame_count} | Violations saved: {violation_count}")
+print(f"\nDone | Total frames: {frame_count} | Violations saved: {violation_count}")
